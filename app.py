@@ -1,7 +1,8 @@
 """
 Deepgram WebSocket Proxy Service
-Provides WebSocket interface for real-time audio streaming transcription
+Provides WebSocket interface for real-time audio streaming transcription and text-to-speech
 Optimized for telephony integration (Talkdesk, Twilio, etc.)
+Supports both STT (Speech-to-Text) and TTS (Text-to-Speech) via REST and WebSocket
 Connects directly to Deepgram's WebSocket API
 """
 import os
@@ -24,7 +25,9 @@ app = FastAPI(title="Deepgram WebSocket Proxy - Telephony Ready")
 
 # Configuration
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
+DEEPGRAM_STT_WS_URL = "wss://api.deepgram.com/v1/listen"  # STT WebSocket endpoint
+DEEPGRAM_TTS_WS_URL = "wss://api.deepgram.com/v1/speak"   # TTS WebSocket endpoint
+DEEPGRAM_TTS_REST_URL = "https://api.deepgram.com/v1/speak"  # TTS REST endpoint
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "4002"))
 
@@ -44,10 +47,16 @@ security = HTTPBearer()
 # Deepgram pricing (per minute of audio, as of 2024)
 # These are approximate - adjust based on actual Deepgram pricing
 DEEPGRAM_PRICING = {
+    # STT models (per minute of audio processed)
     "nova-2": 0.0043,  # $0.0043 per minute
     "base": 0.0043,    # $0.0043 per minute
     "enhanced": 0.0043, # $0.0043 per minute
     "whisper-large": 0.0043,  # $0.0043 per minute (used for STT)
+    # TTS models (per minute of generated audio)
+    "aura-asteria-en": 0.015,  # $0.015 per minute (example pricing)
+    "aura-2-thalia-fr": 0.015,  # $0.015 per minute
+    "aura-luna-en": 0.015,  # $0.015 per minute
+    "aura-stella-en": 0.015,  # $0.015 per minute
 }
 
 
@@ -57,18 +66,22 @@ async def log_usage_to_litellm(
     duration_seconds: float,
     audio_bytes: int,
     call_id: str,
-    transcription_count: int = 0
+    service_type: str = "stt",
+    transcription_count: int = 0,
+    text_length: int = 0  # For TTS: length of text converted to speech
 ) -> bool:
     """
     Log usage to LiteLLM for cost tracking
     
     Args:
         api_key: The API key used for the request
-        model: Deepgram model used (e.g., "nova-2", "whisper-large")
-        duration_seconds: Duration of audio processed in seconds
-        audio_bytes: Total bytes of audio processed
+        model: Deepgram model used (e.g., "nova-2", "aura-asteria-en")
+        duration_seconds: Duration of audio processed/generated in seconds
+        audio_bytes: Total bytes of audio processed/generated
         call_id: Call/connection identifier
-        transcription_count: Number of transcriptions generated
+        service_type: "stt" for speech-to-text, "tts" for text-to-speech
+        transcription_count: Number of transcriptions generated (STT only)
+        text_length: Length of text converted to speech (TTS only)
     
     Returns:
         True if logging succeeded, False otherwise
@@ -77,17 +90,26 @@ async def log_usage_to_litellm(
         # Calculate cost based on duration
         duration_minutes = duration_seconds / 60.0
         model_key = model.split("/")[-1] if "/" in model else model
-        price_per_minute = DEEPGRAM_PRICING.get(model_key, DEEPGRAM_PRICING["nova-2"])
+        # Try to get pricing for the model, fall back to default based on service type
+        price_per_minute = DEEPGRAM_PRICING.get(model_key)
+        if not price_per_minute:
+            # Default pricing based on service type
+            price_per_minute = DEEPGRAM_PRICING.get("aura-asteria-en" if service_type == "tts" else "nova-2", 0.0043)
         cost = duration_minutes * price_per_minute
         
-        # Estimate tokens (rough approximation: 1 token per 4 characters of transcription)
-        # For STT, we use duration as a proxy since we don't have exact token count
-        # Deepgram charges by audio duration, not tokens
-        estimated_tokens = int(duration_seconds * 10)  # Rough estimate: ~10 tokens per second of audio
+        # Estimate tokens
+        if service_type == "tts":
+            # For TTS: estimate tokens based on text length
+            estimated_tokens = int(text_length / 4) if text_length > 0 else int(duration_seconds * 10)
+            prompt_tokens = estimated_tokens  # Text input
+            completion_tokens = int(duration_seconds * 10)  # Audio output (rough estimate)
+        else:
+            # For STT: estimate tokens based on duration
+            estimated_tokens = int(duration_seconds * 10)  # Rough estimate: ~10 tokens per second of audio
+            prompt_tokens = 0  # STT doesn't have prompt tokens
+            completion_tokens = estimated_tokens
         
         # Prepare usage log payload in LiteLLM's expected format
-        # LiteLLM tracks costs via spend logs in the database
-        # Format matches LiteLLM's internal spend log structure
         usage_data = {
             "model": f"deepgram/{model_key}",
             "api_key": api_key,
@@ -95,16 +117,17 @@ async def log_usage_to_litellm(
             "request_id": call_id,
             "response_cost": cost,
             "total_tokens": estimated_tokens,
-            "prompt_tokens": 0,  # STT doesn't have prompt tokens
-            "completion_tokens": estimated_tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             "spend": cost,  # Total spend for this request
             "metadata": {
                 "provider": "deepgram",
-                "service": "stt_streaming",
+                "service": f"{service_type}_streaming" if service_type == "stt" else f"{service_type}_{'streaming' if audio_bytes > 0 else 'rest'}",
                 "duration_seconds": duration_seconds,
                 "duration_minutes": duration_minutes,
                 "audio_bytes": audio_bytes,
                 "transcription_count": transcription_count,
+                "text_length": text_length,
                 "model": model_key,
                 "call_id": call_id,
                 "user_api_key": api_key
@@ -422,7 +445,7 @@ async def websocket_transcribe(
         deepgram_params["encoding"] = encoding
     
     query_string = "&".join([f"{k}={v}" for k, v in deepgram_params.items()])
-    deepgram_uri = f"{DEEPGRAM_WS_URL}?{query_string}"
+    deepgram_uri = f"{DEEPGRAM_STT_WS_URL}?{query_string}"
     
     logger.info(f"Connecting to Deepgram with params: {deepgram_params}")
     
@@ -612,6 +635,7 @@ async def websocket_transcribe(
                     duration_seconds=duration,
                     audio_bytes=conn_data.get("bytes_sent", 0),
                     call_id=call_id,
+                    service_type="stt",
                     transcription_count=conn_data.get("transcription_count", 0)
                 )
             
@@ -629,6 +653,383 @@ async def websocket_transcribe(
         logger.info(f"WebSocket connection closed: {connection_id}")
 
 
+@app.post("/v1/speak")
+async def tts_speak(
+    text: str,
+    model: str = Query("aura-asteria-en", description="TTS model/voice to use"),
+    encoding: str = Query("linear16", description="Audio encoding"),
+    container: str = Query("wav", description="Audio container format"),
+    sample_rate: int = Query(24000, description="Audio sample rate (Hz)", ge=8000, le=48000),
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    """
+    REST endpoint for Text-to-Speech (TTS)
+    Returns complete audio file in response
+    
+    Args:
+        text: Text to convert to speech
+        model: TTS model/voice (e.g., "aura-asteria-en", "aura-2-thalia-fr")
+        encoding: Audio encoding (linear16, mulaw, alaw, etc.)
+        container: Audio container format (wav, mp3, etc.)
+        sample_rate: Audio sample rate in Hz
+        credentials: API key authentication
+    
+    Returns:
+        Audio file (binary response)
+    """
+    api_key = credentials.credentials if credentials else None
+    
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    # Validate API key
+    is_valid, error_msg, key_info = await validate_api_key_with_litellm(api_key)
+    if not is_valid:
+        raise HTTPException(status_code=401, detail=error_msg or "Invalid API key")
+    
+    # Build Deepgram TTS REST URL
+    params = {
+        "model": model,
+        "encoding": encoding,
+        "container": container,
+        "sample_rate": str(sample_rate)
+    }
+    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+    deepgram_url = f"{DEEPGRAM_TTS_REST_URL}?{query_string}"
+    
+    logger.info(f"TTS REST request: model={model}, text_length={len(text)}")
+    
+    try:
+        start_time = time.time()
+        call_id = f"tts-rest-{int(time.time())}"
+        
+        # Forward request to Deepgram
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                deepgram_url,
+                json={"text": text},
+                headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+            )
+            
+            if response.status_code != 200:
+                error_detail = response.text
+                try:
+                    error_json = response.json()
+                    error_detail = error_json.get("error", {}).get("message", error_detail)
+                except:
+                    pass
+                raise HTTPException(status_code=response.status_code, detail=error_detail)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            audio_data = response.content
+            
+            # Estimate audio duration (rough calculation based on sample rate and data size)
+            # For linear16: bytes = samples * 2 (16-bit = 2 bytes per sample)
+            estimated_duration_seconds = len(audio_data) / (sample_rate * 2) if encoding == "linear16" else duration
+            
+            # Log usage to LiteLLM
+            await log_usage_to_litellm(
+                api_key=api_key,
+                model=model,
+                duration_seconds=estimated_duration_seconds,
+                audio_bytes=len(audio_data),
+                call_id=call_id,
+                service_type="tts",
+                text_length=len(text)
+            )
+            
+            logger.info(f"TTS REST completed: {len(text)} chars -> {len(audio_data)} bytes ({estimated_duration_seconds:.2f}s)")
+            
+            # Return audio file
+            from fastapi.responses import Response
+            content_type = "audio/wav" if container == "wav" else f"audio/{container}"
+            return Response(
+                content=audio_data,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="tts_output.{container}"',
+                    "X-Duration-Seconds": str(estimated_duration_seconds),
+                    "X-Model": model
+                }
+            )
+            
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout waiting for TTS response")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"TTS REST error: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
+
+
+@app.websocket("/ws/speak")
+async def websocket_speak(
+    websocket: WebSocket,
+    call_id: Optional[str] = Query(None, description="Call identifier for tracking"),
+    model: str = Query("aura-asteria-en", description="TTS model/voice to use"),
+    encoding: str = Query("linear16", description="Audio encoding"),
+    sample_rate: int = Query(24000, description="Audio sample rate (Hz)", ge=8000, le=48000),
+    container: str = Query("none", description="Audio container (none for streaming)")
+):
+    """
+    WebSocket endpoint for streaming Text-to-Speech (TTS)
+    Streams audio chunks back in real-time for low-latency use cases
+    
+    Client sends JSON messages:
+    - {"type": "Speak", "text": "text to speak"}
+    - {"type": "Flush"} - request audio output for buffered text
+    - {"type": "Clear"} - clear buffer
+    - {"type": "Close"} - close connection
+    
+    Server sends:
+    - JSON metadata messages: {"type": "Metadata", ...}
+    - Binary audio chunks: raw audio data
+    
+    Args:
+        websocket: WebSocket connection
+        call_id: Optional call identifier
+        model: TTS model/voice (e.g., "aura-asteria-en")
+        encoding: Audio encoding (linear16, mulaw, alaw, etc.)
+        sample_rate: Audio sample rate in Hz
+        container: Audio container format (use "none" for streaming)
+    """
+    # Extract API key from Authorization header
+    api_key = await get_api_key_from_websocket(websocket)
+    
+    # Validate API key before accepting connection
+    is_valid, error_msg, key_info = await validate_api_key_with_litellm(api_key)
+    if not is_valid:
+        logger.warning(f"TTS WebSocket auth failed: {error_msg} from {websocket.client.host}")
+        await websocket.close(code=1008, reason=error_msg or "Authentication failed")
+        return
+    
+    await websocket.accept()
+    connection_id = f"{websocket.client.host}:{websocket.client.port}-{int(time.time())}"
+    call_id = call_id or connection_id
+    
+    logger.info(f"TTS WebSocket connection accepted: {connection_id} (call_id: {call_id}, model: {model})")
+    
+    connection_start = time.time()
+    active_connections[connection_id] = {
+        "call_id": call_id,
+        "service": "tts",
+        "started_at": datetime.utcnow().isoformat(),
+        "started_at_timestamp": connection_start,
+        "bytes_received": 0,  # Text bytes
+        "bytes_sent": 0,  # Audio bytes
+        "text_length": 0,
+        "audio_chunks": 0,
+        "model": model,
+        "encoding": encoding,
+        "sample_rate": sample_rate,
+        "key_type": key_info.get("type", "unknown") if key_info else "unknown"
+    }
+    
+    # Build Deepgram TTS WebSocket URL
+    deepgram_params = {
+        "model": model,
+        "encoding": encoding,
+        "sample_rate": str(sample_rate),
+        "container": container
+    }
+    query_string = "&".join([f"{k}={v}" for k, v in deepgram_params.items()])
+    deepgram_uri = f"{DEEPGRAM_TTS_WS_URL}?{query_string}"
+    
+    logger.info(f"Connecting to Deepgram TTS with params: {deepgram_params}")
+    
+    try:
+        # Connect to Deepgram TTS WebSocket
+        async with websockets.connect(
+            deepgram_uri,
+            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+        ) as dg_ws:
+            logger.info("Connected to Deepgram TTS WebSocket")
+            
+            # Send ready message to client
+            await websocket.send_json({
+                "type": "ready",
+                "message": "Connection established, ready to receive text for TTS"
+            })
+            
+            connection_active = True
+            dg_connection_closed = asyncio.Event()
+            total_text_length = 0
+            
+            async def forward_text_to_deepgram():
+                """Forward text messages from client to Deepgram"""
+                nonlocal connection_active, total_text_length
+                try:
+                    while connection_active:
+                        try:
+                            # Receive JSON message from client
+                            message = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+                            
+                            msg_type = message.get("type", "").lower()
+                            
+                            if msg_type == "speak":
+                                text = message.get("text", "")
+                                if text:
+                                    # Send Speak message to Deepgram
+                                    await dg_ws.send(json.dumps({
+                                        "type": "Speak",
+                                        "text": text
+                                    }))
+                                    total_text_length += len(text)
+                                    active_connections[connection_id]["text_length"] = total_text_length
+                                    active_connections[connection_id]["bytes_received"] += len(text.encode())
+                                    logger.debug(f"[{call_id}] Sent text to Deepgram: {len(text)} chars")
+                                    
+                            elif msg_type == "flush":
+                                # Request audio output for buffered text
+                                await dg_ws.send(json.dumps({"type": "Flush"}))
+                                logger.debug(f"[{call_id}] Flush requested")
+                                
+                            elif msg_type == "clear":
+                                # Clear buffer
+                                await dg_ws.send(json.dumps({"type": "Clear"}))
+                                logger.debug(f"[{call_id}] Clear requested")
+                                
+                            elif msg_type == "close":
+                                # Close connection
+                                connection_active = False
+                                await dg_ws.send(json.dumps({"type": "Close"}))
+                                logger.info(f"[{call_id}] Close requested by client")
+                                break
+                                
+                        except asyncio.TimeoutError:
+                            # Continue waiting
+                            continue
+                            
+                except WebSocketDisconnect:
+                    logger.info(f"Client disconnected: {connection_id}")
+                    connection_active = False
+                    try:
+                        await dg_ws.send(json.dumps({"type": "Close"}))
+                    except:
+                        pass
+                except Exception as e:
+                    logger.error(f"Error forwarding text: {e}")
+                    connection_active = False
+                    try:
+                        await dg_ws.send(json.dumps({"type": "Close"}))
+                    except:
+                        pass
+            
+            async def forward_audio_to_client():
+                """Forward audio chunks and metadata from Deepgram to client"""
+                try:
+                    async for message in dg_ws:
+                        # Deepgram TTS can send both JSON (metadata) and binary (audio)
+                        if isinstance(message, str):
+                            # JSON metadata message
+                            try:
+                                data = json.loads(message)
+                                msg_type = data.get("type", "")
+                                
+                                if msg_type == "Metadata":
+                                    # Send metadata to client
+                                    await websocket.send_json({
+                                        "type": "metadata",
+                                        "data": data,
+                                        "call_id": call_id,
+                                        "timestamp": datetime.utcnow().isoformat()
+                                    })
+                                elif msg_type == "SpeechStarted":
+                                    logger.debug(f"[{call_id}] Speech started")
+                                elif msg_type == "UtteranceEnd":
+                                    logger.debug(f"[{call_id}] Utterance ended")
+                                    
+                            except json.JSONDecodeError:
+                                logger.warning(f"Invalid JSON from Deepgram: {message}")
+                        else:
+                            # Binary audio data
+                            if isinstance(message, bytes):
+                                await websocket.send_bytes(message)
+                                active_connections[connection_id]["bytes_sent"] += len(message)
+                                active_connections[connection_id]["audio_chunks"] += 1
+                                logger.debug(f"[{call_id}] Sent audio chunk: {len(message)} bytes")
+                    
+                    dg_connection_closed.set()
+                    
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info(f"Deepgram TTS connection closed for {connection_id}")
+                    dg_connection_closed.set()
+                except Exception as e:
+                    logger.error(f"Error receiving audio: {e}")
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": str(e),
+                            "call_id": call_id
+                        })
+                    except:
+                        pass
+                    dg_connection_closed.set()
+            
+            # Run text forwarding and audio forwarding concurrently
+            try:
+                await asyncio.gather(
+                    forward_text_to_deepgram(),
+                    forward_audio_to_client(),
+                    return_exceptions=True
+                )
+            except Exception as e:
+                logger.error(f"Error in TTS communication loop: {e}")
+            
+            # Wait for Deepgram to close
+            if not dg_connection_closed.is_set():
+                try:
+                    await asyncio.wait_for(dg_connection_closed.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                
+    except Exception as e:
+        logger.error(f"TTS WebSocket error for {connection_id}: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e),
+                "call_id": call_id
+            })
+        except:
+            pass
+    finally:
+        # Clean up and log usage
+        if connection_id in active_connections:
+            duration = time.time() - connection_start
+            conn_data = active_connections.pop(connection_id)
+            
+            # Log usage to LiteLLM for cost tracking
+            if duration > 0 and conn_data.get("bytes_sent", 0) > 0:
+                # Estimate audio duration
+                estimated_duration = conn_data.get("bytes_sent", 0) / (sample_rate * 2) if encoding == "linear16" else duration
+                
+                await log_usage_to_litellm(
+                    api_key=api_key or MASTER_KEY,
+                    model=model,
+                    duration_seconds=estimated_duration,
+                    audio_bytes=conn_data.get("bytes_sent", 0),
+                    call_id=call_id,
+                    service_type="tts",
+                    text_length=conn_data.get("text_length", 0)
+                )
+            
+            logger.info(
+                f"TTS WebSocket closed: {connection_id} - "
+                f"Duration: {duration:.2f}s, "
+                f"Text: {conn_data.get('text_length', 0)} chars, "
+                f"Audio: {conn_data.get('bytes_sent', 0)} bytes, "
+                f"Chunks: {conn_data.get('audio_chunks', 0)}"
+            )
+        
+        try:
+            await websocket.close()
+        except:
+            pass
+        logger.info(f"TTS WebSocket connection closed: {connection_id}")
+
+
 @app.get("/test/stream")
 async def test_stream_endpoint():
     """
@@ -637,8 +1038,11 @@ async def test_stream_endpoint():
     return {
         "status": "ok",
         "message": "Deepgram WebSocket proxy is running",
-        "websocket_url": f"ws://localhost:{PORT}/ws/transcribe",
-        "deepgram_endpoint": DEEPGRAM_WS_URL
+        "stt_websocket_url": f"ws://localhost:{PORT}/ws/transcribe",
+        "tts_websocket_url": f"ws://localhost:{PORT}/ws/speak",
+        "tts_rest_url": f"http://localhost:{PORT}/v1/speak",
+        "deepgram_stt_endpoint": DEEPGRAM_STT_WS_URL,
+        "deepgram_tts_endpoint": DEEPGRAM_TTS_WS_URL
     }
 
 
