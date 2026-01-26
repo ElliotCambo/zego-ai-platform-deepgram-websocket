@@ -10,7 +10,7 @@ import json
 import asyncio
 import time
 from typing import Optional, Dict, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Header, Depends
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -109,11 +109,18 @@ async def log_usage_to_litellm(
             prompt_tokens = 0  # STT doesn't have prompt tokens
             completion_tokens = estimated_tokens
         
+        # Determine model name with streaming/non-streaming distinction
+        # Format: deepgram/{model}-{service_type}-{streaming_type}
+        # Examples: deepgram/nova-2-stt-streaming, deepgram/nova-2-stt-rest, deepgram/aura-asteria-en-tts-streaming
+        streaming_type = "streaming" if service_type == "stt" else ("streaming" if audio_bytes > 0 else "rest")
+        model_name = f"deepgram/{model_key}-{service_type}-{streaming_type}"
+        
         # Prepare usage log payload in LiteLLM's expected format
         usage_data = {
-            "model": f"deepgram/{model_key}",
+            "model": model_name,
+            "custom_llm_provider": "deepgram",
             "api_key": api_key,
-            "litellm_model_id": f"deepgram/{model_key}",
+            "litellm_model_id": model_name,
             "request_id": call_id,
             "response_cost": cost,
             "total_tokens": estimated_tokens,
@@ -122,7 +129,7 @@ async def log_usage_to_litellm(
             "spend": cost,  # Total spend for this request
             "metadata": {
                 "provider": "deepgram",
-                "service": f"{service_type}_streaming" if service_type == "stt" else f"{service_type}_{'streaming' if audio_bytes > 0 else 'rest'}",
+                "service": f"{service_type}_{streaming_type}",
                 "duration_seconds": duration_seconds,
                 "duration_minutes": duration_minutes,
                 "audio_bytes": audio_bytes,
@@ -132,52 +139,120 @@ async def log_usage_to_litellm(
                 "call_id": call_id,
                 "user_api_key": api_key
             },
-            "start_time": datetime.utcnow().isoformat(),
-            "end_time": datetime.utcnow().isoformat()
+            "start_time": datetime.now(timezone.utc).isoformat(),
+            "end_time": datetime.now(timezone.utc).isoformat()
         }
         
-        # Send to LiteLLM's internal logging endpoint
-        # LiteLLM uses /internal/usage/log or we can use the spend tracking endpoint
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            try:
-                # Try multiple possible endpoints
-                endpoints = [
-                    f"{LITELLM_API_BASE}/internal/usage/log",
-                    f"{LITELLM_API_BASE}/usage/log",
-                    f"{LITELLM_API_BASE}/spend/log"
-                ]
-                
-                success = False
-                for endpoint in endpoints:
+        # Use LiteLLM's internal logging mechanism via a mock completion call
+        # This is cleaner than direct DB inserts and uses LiteLLM's own logging infrastructure
+        # LiteLLM doesn't expose a public API for external usage logging, but we can use its internal logging
+        try:
+            # Import litellm to use its logging infrastructure
+            import litellm
+            from litellm import LiteLLMLoggingObj
+            
+            # Create a logging object that LiteLLM will process
+            # This mimics what LiteLLM does internally when processing requests
+            logging_obj = LiteLLMLoggingObj(
+                model=model_name,
+                messages=[],  # Empty messages for non-LLM usage
+                stream=False,
+                call_type="completion",
+                start_time=datetime.now(timezone.utc),
+                litellm_call_id=call_id,
+                function_id="",
+                litellm_trace_id=None
+            )
+            
+            # Set the response data that LiteLLM expects
+            logging_obj.model = model_name
+            logging_obj.response_cost = cost
+            logging_obj.total_tokens = estimated_tokens
+            logging_obj.prompt_tokens = prompt_tokens
+            logging_obj.completion_tokens = completion_tokens
+            logging_obj.spend = cost
+            logging_obj.custom_llm_provider = "deepgram"
+            logging_obj.api_key = api_key
+            logging_obj.metadata = usage_data["metadata"]
+            logging_obj.end_time = datetime.now(timezone.utc)
+            
+            # Use LiteLLM's internal logging callback system
+            # This will write to the database using LiteLLM's own logic
+            if hasattr(litellm, 'callback_list') and litellm.callback_list:
+                for callback in litellm.callback_list:
                     try:
-                        response = await client.post(
-                            endpoint,
-                            json=usage_data,
-                            headers={"Authorization": f"Bearer {MASTER_KEY}"}
+                        if hasattr(callback, 'log_success_event'):
+                            # Call the success callback which logs to database
+                            await callback.log_success_event(logging_obj)
+                            logger.info(f"Logged usage via LiteLLM callback: {call_id} - ${cost:.6f} ({duration_minutes:.2f} min) - {model_name}")
+                            return True
+                    except Exception as callback_error:
+                        logger.debug(f"Callback error: {callback_error}")
+                        continue
+            
+            # If callbacks don't work, fall back to direct DB insert
+            # This is a workaround since LiteLLM doesn't expose a public API for external usage
+            logger.warning("LiteLLM callbacks not available, using direct DB insert as fallback")
+            raise Exception("Callbacks not available")
+            
+        except Exception as callback_error:
+            # Fallback: Direct database insert (workaround since no public API exists)
+            # Note: This is not ideal but necessary since LiteLLM doesn't expose a usage logging API
+            logger.debug(f"Could not use LiteLLM callbacks: {callback_error}, using direct DB insert")
+            try:
+                import asyncpg
+                import re
+                database_url = os.getenv("LITELLM_DATABASE_URL", "postgresql://litellm:litellm@zego-postgres:5432/litellm")
+                
+                # Parse database URL
+                if database_url.startswith("postgresql://"):
+                    # Extract connection details
+                    match = re.match(r"postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)", database_url)
+                    if match:
+                        db_user, db_password, db_host, db_port, db_name = match.groups()
+                        
+                        conn = await asyncpg.connect(
+                            host=db_host,
+                            port=int(db_port),
+                            user=db_user,
+                            password=db_password,
+                            database=db_name
                         )
                         
-                        if response.status_code in [200, 201, 204]:
-                            logger.info(f"Logged usage to LiteLLM: {call_id} - ${cost:.6f} ({duration_minutes:.2f} min)")
-                            success = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"Tried {endpoint}, error: {e}")
-                        continue
-                
-                if not success:
-                    # Fallback: Try to log via LiteLLM's database directly if we have access
-                    # Or log to a file that LiteLLM can ingest
-                    logger.warning(f"Could not log usage to LiteLLM endpoints, but usage tracked: {call_id} - ${cost:.6f}")
-                    # Still return True as we attempted to log
-                    return True
-                
-                return success
-                
-            except httpx.TimeoutException:
-                logger.warning("Timeout logging usage to LiteLLM")
+                        try:
+                            # Insert into LiteLLM_SpendLogs table
+                            # Note: Table uses camelCase column names (endTime, startTime, not end_time, start_time)
+                            await conn.execute("""
+                                INSERT INTO "LiteLLM_SpendLogs" (
+                                    model, custom_llm_provider, model_id, request_id,
+                                    total_tokens, prompt_tokens, completion_tokens,
+                                    spend, metadata, "startTime", "endTime", api_key, call_type
+                                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                            """,
+                                model_name,
+                                "deepgram",
+                                model_name,
+                                call_id,
+                                estimated_tokens,
+                                prompt_tokens,
+                                completion_tokens,
+                                cost,
+                                json.dumps(usage_data["metadata"]),
+                                usage_data["start_time"],
+                                usage_data["end_time"],
+                                api_key,
+                                "completion"  # call_type is required
+                            )
+                            
+                            logger.info(f"Logged usage to LiteLLM DB (fallback): {call_id} - ${cost:.6f} ({duration_minutes:.2f} min) - {model_name}")
+                            return True
+                        finally:
+                            await conn.close()
+            except ImportError:
+                logger.error("asyncpg not available, cannot log usage")
                 return False
-            except Exception as e:
-                logger.warning(f"Error logging usage to LiteLLM: {e}")
+            except Exception as db_error:
+                logger.error(f"Could not log to database: {db_error}")
                 return False
                 
     except Exception as e:
@@ -275,7 +350,7 @@ async def health():
         "status": "healthy",
         "service": "deepgram-websocket-proxy",
         "active_connections": len(active_connections),
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
@@ -418,7 +493,7 @@ async def websocket_transcribe(
     connection_start = time.time()
     active_connections[connection_id] = {
         "call_id": call_id,
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "started_at_timestamp": connection_start,
         "bytes_sent": 0,
         "transcription_count": 0,
@@ -537,7 +612,7 @@ async def websocket_transcribe(
                                 "type": "deepgram_response",
                                 "data": response,
                                 "call_id": call_id,
-                                "timestamp": datetime.utcnow().isoformat()
+                                "timestamp": datetime.now(timezone.utc).isoformat()
                             })
                         except Exception as e:
                             logger.error(f"Error sending response to client: {e}")
@@ -559,7 +634,7 @@ async def websocket_transcribe(
                                             "is_final": is_final,
                                             "confidence": confidence,
                                             "call_id": call_id,
-                                            "timestamp": datetime.utcnow().isoformat()
+                                            "timestamp": datetime.now(timezone.utc).isoformat()
                                         })
                                         logger.debug(f"[{call_id}] Sent transcript: {transcript[:50]}...")
                                     except Exception as e:
@@ -814,7 +889,7 @@ async def websocket_speak(
     active_connections[connection_id] = {
         "call_id": call_id,
         "service": "tts",
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "started_at_timestamp": connection_start,
         "bytes_received": 0,  # Text bytes
         "bytes_sent": 0,  # Audio bytes
@@ -933,7 +1008,7 @@ async def websocket_speak(
                                         "type": "metadata",
                                         "data": data,
                                         "call_id": call_id,
-                                        "timestamp": datetime.utcnow().isoformat()
+                                        "timestamp": datetime.now(timezone.utc).isoformat()
                                     })
                                 elif msg_type == "SpeechStarted":
                                     logger.debug(f"[{call_id}] Speech started")
